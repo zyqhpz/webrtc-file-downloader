@@ -104,6 +104,7 @@ type incomingTransfer struct {
 	receivedBytes  int64
 	nextSequence   uint64
 	chunksInBatch  int
+	startedAt      time.Time
 
 	tempPath  string
 	finalPath string
@@ -642,6 +643,7 @@ func (s *peerSession) startIncomingTransfer(message fileStartControl) error {
 		name:           message.Name,
 		expectedSize:   message.SizeBytes,
 		expectedSHA256: message.SHA256,
+		startedAt:      time.Now(),
 		tempPath:       tempPath,
 		finalPath:      finalPath,
 		file:           file,
@@ -740,6 +742,7 @@ func (s *peerSession) finishIncomingTransfer(transferID string) error {
 		transfer.abort()
 		return err
 	}
+	duration := time.Since(transfer.startedAt)
 
 	if err := s.sendControl(fileReceivedControl{
 		Type:       "file_received",
@@ -751,7 +754,16 @@ func (s *peerSession) finishIncomingTransfer(transferID string) error {
 		s.log.Error("send file completion acknowledgement", "session_id", s.id, "transfer_id", transferID, "error", err)
 	}
 
-	s.log.Info("file transfer completed", "session_id", s.id, "transfer_id", transferID, "file", fileName, "size_bytes", size, "sha256", checksum)
+	s.log.Info(
+		"file transfer completed",
+		"session_id", s.id,
+		"transfer_id", transferID,
+		"file", fileName,
+		"size_bytes", size,
+		"sha256", checksum,
+		"duration", duration.String(),
+		"duration_ms", duration.Milliseconds(),
+	)
 	return nil
 }
 

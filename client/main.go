@@ -684,6 +684,7 @@ func (s *peerSession) sendSelectedFile(request requestFileControl, transfer *out
 		return errors.New("file changed while its checksum was being calculated")
 	}
 
+	startedAt := time.Now()
 	if err := s.sendControl(fileStartControl{
 		Type:       "file_start",
 		TransferID: request.TransferID,
@@ -731,6 +732,7 @@ func (s *peerSession) sendSelectedFile(request requestFileControl, transfer *out
 	if !strings.EqualFold(completion.SHA256, checksum) {
 		return fmt.Errorf("server confirmed unexpected checksum: got %s, want %s", completion.SHA256, checksum)
 	}
+	duration := time.Since(startedAt)
 
 	s.log.Info(
 		"server verified transferred file",
@@ -738,6 +740,8 @@ func (s *peerSession) sendSelectedFile(request requestFileControl, transfer *out
 		"server_file_name", completion.FileName,
 		"size_bytes", completion.SizeBytes,
 		"sha256", completion.SHA256,
+		"duration", duration.String(),
+		"duration_ms", duration.Milliseconds(),
 	)
 	return nil
 }
