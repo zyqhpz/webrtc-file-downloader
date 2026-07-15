@@ -21,6 +21,8 @@ import (
 	"syscall"
 	"time"
 
+	"webrtc-file-downloader/internal/config"
+
 	"github.com/pion/webrtc/v4"
 )
 
@@ -44,10 +46,6 @@ const (
 	MaxSignalBodyBytes     = 2 * 1024 * 1024
 	MaxTransferSizeBytes   = int64(2 * 1024 * 1024 * 1024)
 
-	DefaultSignalingURL  = "http://127.0.0.1:8080"
-	DefaultSTUNURLs      = "stun:stun.l.google.com:19302"
-	DefaultLocalFileName = "100mb_test.txt"
-
 	SignalRequestTimeout        = 45 * time.Second
 	ConnectionStartupTimeout    = 45 * time.Second
 	DisconnectedGracePeriod     = 20 * time.Second
@@ -64,14 +62,7 @@ var (
 	errTransferBusy        = errors.New("another file transfer is already active")
 )
 
-type config struct {
-	SignalingURL string
-	ClientID     string
-	STUNURLs     []string
-}
-
 type agent struct {
-	cfg        config
 	log        *slog.Logger
 	httpClient *http.Client
 }
@@ -170,8 +161,7 @@ type errorControl struct {
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	cfg, err := loadConfig()
-	if err != nil {
+	if err := config.LoadClient(); err != nil {
 		logger.Error("load configuration", "error", err)
 		os.Exit(1)
 	}
@@ -180,8 +170,7 @@ func main() {
 	defer stop()
 
 	client := &agent{
-		cfg: cfg,
-		log: logger.With("client_id", cfg.ClientID),
+		log: logger.With("client_id", config.AppConfig.ClientID),
 		httpClient: &http.Client{
 			Timeout: SignalRequestTimeout,
 		},
@@ -189,8 +178,10 @@ func main() {
 
 	logger.Info(
 		"file transfer client starting",
-		"client_id", cfg.ClientID,
-		"signaling_url", cfg.SignalingURL,
+		"client_id", config.AppConfig.ClientID,
+		"signaling_url", config.AppConfig.SignalingURL,
+		"local_file_path", config.AppConfig.LocalFilePath,
+		"local_file_name", config.AppConfig.LocalFileName,
 	)
 
 	if err := client.run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
@@ -199,48 +190,6 @@ func main() {
 	}
 
 	logger.Info("client stopped")
-}
-
-func loadConfig() (config, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown-client"
-	}
-
-	signalingURL := strings.TrimRight(getenv("SIGNALING_URL", DefaultSignalingURL), "/")
-	parsedURL, err := url.Parse(signalingURL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-		return config{}, fmt.Errorf("SIGNALING_URL must be an absolute HTTP or HTTPS URL")
-	}
-	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-		return config{}, fmt.Errorf("SIGNALING_URL scheme must be http or https")
-	}
-
-	stunURLs := splitNonEmpty(getenv("STUN_URLS", DefaultSTUNURLs))
-
-	return config{
-		SignalingURL: signalingURL,
-		ClientID:     getenv("CLIENT_ID", hostname),
-		STUNURLs:     stunURLs,
-	}, nil
-}
-
-func getenv(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		return value
-	}
-	return fallback
-}
-
-func splitNonEmpty(value string) []string {
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }
 
 func (a *agent) run(ctx context.Context) error {
@@ -277,7 +226,7 @@ func (a *agent) run(ctx context.Context) error {
 
 func (a *agent) runConnection(parent context.Context) (bool, error) {
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: a.cfg.STUNURLs}},
+		ICEServers: []webrtc.ICEServer{{URLs: config.AppConfig.STUNURLs}},
 	})
 	if err != nil {
 		return false, fmt.Errorf("create peer connection: %w", err)
@@ -368,7 +317,7 @@ func (a *agent) runConnection(parent context.Context) (bool, error) {
 
 func (a *agent) createSignalingSession(ctx context.Context, offer webrtc.SessionDescription) (signalResponse, error) {
 	payload, err := json.Marshal(signalRequest{
-		ClientID: a.cfg.ClientID,
+		ClientID: config.AppConfig.ClientID,
 		Offer:    offer,
 	})
 	if err != nil {
@@ -378,7 +327,7 @@ func (a *agent) createSignalingSession(ctx context.Context, offer webrtc.Session
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		a.cfg.SignalingURL+"/api/v1/webrtc/sessions",
+		config.AppConfig.SignalingURL+"/api/v1/webrtc/sessions",
 		bytes.NewReader(payload),
 	)
 	if err != nil {
@@ -432,7 +381,7 @@ func (a *agent) deleteSignalingSession(sessionID string) {
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodDelete,
-		a.cfg.SignalingURL+"/api/v1/webrtc/sessions/"+url.PathEscape(sessionID),
+		config.AppConfig.SignalingURL+"/api/v1/webrtc/sessions/"+url.PathEscape(sessionID),
 		nil,
 	)
 	if err != nil {
@@ -958,19 +907,13 @@ func (s *peerSession) close() {
 }
 
 // selectFileForTransfer is intentionally owned by the client. The server only
-// requests a transfer and never specifies a path or filename. Replace this
-// function when the client needs application-specific file selection logic.
+// requests a transfer and never specifies a path or filename.
 func selectFileForTransfer(ctx context.Context) (*os.File, os.FileInfo, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, "", err
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("resolve client home directory: %w", err)
-	}
-
-	selectedPath := filepath.Join(home, DefaultLocalFileName)
+	selectedPath := filepath.Join(config.AppConfig.LocalFilePath, config.AppConfig.LocalFileName)
 	canonicalPath, err := filepath.EvalSymlinks(selectedPath)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("resolve client-selected file: %w", err)

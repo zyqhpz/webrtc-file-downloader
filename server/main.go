@@ -21,6 +21,8 @@ import (
 	"syscall"
 	"time"
 
+	"webrtc-file-downloader/internal/config"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/pion/webrtc/v4"
@@ -54,9 +56,6 @@ const (
 
 	// MaxTransferSizeBytes is a safety limit, not a WebRTC protocol limit.
 	MaxTransferSizeBytes int64 = 2 * 1024 * 1024 * 1024
-
-	DefaultListenAddress = ":8080"
-	DefaultDownloadDir   = "./tmp/downloads"
 )
 
 var (
@@ -66,15 +65,7 @@ var (
 	errUnexpectedTransferID = errors.New("unexpected transfer ID")
 )
 
-type config struct {
-	ListenAddress string
-	DownloadDir   string
-	STUNURLs      []string
-	AllowedOrigin string
-}
-
 type application struct {
-	cfg      config
 	log      *slog.Logger
 	sessions *sessionStore
 	webrtc   webrtc.Configuration
@@ -196,25 +187,28 @@ type errorResponse struct {
 }
 
 func main() {
-	cfg := loadConfig()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	if err := os.MkdirAll(cfg.DownloadDir, 0o750); err != nil {
-		logger.Error("create download directory", "error", err, "path", cfg.DownloadDir)
+	if err := config.LoadServer(); err != nil {
+		logger.Error("load configuration", "error", err)
+		os.Exit(1)
+	}
+
+	if err := os.MkdirAll(config.AppConfig.DownloadPath, 0o750); err != nil {
+		logger.Error("create download directory", "error", err, "path", config.AppConfig.DownloadPath)
 		os.Exit(1)
 	}
 
 	app := &application{
-		cfg:      cfg,
 		log:      logger,
 		sessions: newSessionStore(),
 		webrtc: webrtc.Configuration{
-			ICEServers: []webrtc.ICEServer{{URLs: cfg.STUNURLs}},
+			ICEServers: []webrtc.ICEServer{{URLs: config.AppConfig.STUNURLs}},
 		},
 	}
 
 	server := &http.Server{
-		Addr:              cfg.ListenAddress,
+		Addr:              config.AppConfig.ServerAddress,
 		Handler:           app.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       45 * time.Second,
@@ -226,7 +220,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		logger.Info("signaling server started", "address", cfg.ListenAddress, "download_dir", cfg.DownloadDir)
+		logger.Info("signaling server started", "address", config.AppConfig.ServerAddress, "download_path", config.AppConfig.DownloadPath)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("http server failed", "error", err)
 			stop()
@@ -241,33 +235,6 @@ func main() {
 
 	_ = server.Shutdown(shutdownCtx)
 	app.sessions.closeAll()
-}
-
-func loadConfig() config {
-	return config{
-		ListenAddress: getenv("LISTEN_ADDRESS", DefaultListenAddress),
-		DownloadDir:   getenv("DOWNLOAD_DIR", DefaultDownloadDir),
-		STUNURLs:      splitNonEmpty(getenv("STUN_URLS", "stun:stun.l.google.com:19302")),
-		AllowedOrigin: getenv("CORS_ALLOW_ORIGIN", "*"),
-	}
-}
-
-func getenv(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		return value
-	}
-	return fallback
-}
-
-func splitNonEmpty(value string) []string {
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }
 
 func (app *application) routes() http.Handler {
@@ -292,7 +259,7 @@ func (app *application) routes() http.Handler {
 
 func (app *application) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", app.cfg.AllowedOrigin)
+		w.Header().Set("Access-Control-Allow-Origin", config.AppConfig.AllowedOrigin)
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
@@ -337,7 +304,7 @@ func (app *application) createSession(w http.ResponseWriter, r *http.Request) {
 		log:       app.log.With("client_id", request.ClientID),
 		store:     app.sessions,
 		pc:        pc,
-		downloads: app.cfg.DownloadDir,
+		downloads: config.AppConfig.DownloadPath,
 	}
 	app.sessions.add(session)
 	registered := true
