@@ -33,6 +33,7 @@ type Config struct {
 	STUNURLs      []string
 	LocalFilePath string
 	LocalFileName string
+	CreateFile    bool
 }
 
 var AppConfig Config

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -45,6 +46,7 @@ const (
 	MaxControlMessageBytes = DataChannelMessageSizeBytes
 	MaxSignalBodyBytes     = 2 * 1024 * 1024
 	MaxTransferSizeBytes   = int64(2 * 1024 * 1024 * 1024)
+	CreateFileSizeBytes    = int64(100 * 1024 * 1024)
 
 	SignalRequestTimeout        = 45 * time.Second
 	ConnectionStartupTimeout    = 45 * time.Second
@@ -159,11 +161,24 @@ type errorControl struct {
 }
 
 func main() {
+	createFile := flag.Bool("create-file", false, "create the configured local file at 100 MB if it does not exist")
+	flag.Parse()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	if err := config.LoadClient(); err != nil {
 		logger.Error("load configuration", "error", err)
 		os.Exit(1)
+	}
+	config.AppConfig.CreateFile = *createFile
+
+	if config.AppConfig.CreateFile {
+		path, size, created, err := ensureConfiguredLocalFile()
+		if err != nil {
+			logger.Error("prepare local file", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("local file ready", "path", path, "size_bytes", size, "created", created)
 	}
 
 	runCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -182,6 +197,7 @@ func main() {
 		"signaling_url", config.AppConfig.SignalingURL,
 		"local_file_path", config.AppConfig.LocalFilePath,
 		"local_file_name", config.AppConfig.LocalFileName,
+		"create_file", config.AppConfig.CreateFile,
 	)
 
 	if err := client.run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
@@ -943,6 +959,82 @@ func selectFileForTransfer(ctx context.Context) (*os.File, os.FileInfo, string, 
 	}
 
 	return file, info, canonicalPath, nil
+}
+
+func ensureConfiguredLocalFile() (string, int64, bool, error) {
+	selectedPath := filepath.Join(config.AppConfig.LocalFilePath, config.AppConfig.LocalFileName)
+	canonicalPath, err := filepath.EvalSymlinks(selectedPath)
+	if err == nil {
+		canonicalPath = filepath.Clean(canonicalPath)
+		file, err := os.Open(canonicalPath)
+		if err != nil {
+			return "", 0, false, fmt.Errorf("open existing local file: %w", err)
+		}
+		defer file.Close()
+
+		info, err := file.Stat()
+		if err != nil {
+			return "", 0, false, fmt.Errorf("stat existing local file: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", 0, false, errors.New("configured local file is not a regular file")
+		}
+		return canonicalPath, info.Size(), false, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", 0, false, fmt.Errorf("resolve local file: %w", err)
+	}
+
+	if err := createLocalFile(selectedPath, CreateFileSizeBytes); err != nil {
+		return "", 0, false, err
+	}
+
+	canonicalPath, err = filepath.Abs(filepath.Clean(selectedPath))
+	if err != nil {
+		return "", 0, true, fmt.Errorf("resolve created local file: %w", err)
+	}
+	return canonicalPath, CreateFileSizeBytes, true, nil
+}
+
+func createLocalFile(path string, sizeBytes int64) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return fmt.Errorf("create local file directory: %w", err)
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	if err != nil {
+		return fmt.Errorf("create local file: %w", err)
+	}
+	defer file.Close()
+
+	if err := writeTextPattern(file, sizeBytes); err != nil {
+		return fmt.Errorf("write local file: %w", err)
+	}
+	return nil
+}
+
+func writeTextPattern(writer io.Writer, sizeBytes int64) error {
+	const pattern = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+	buffer := make([]byte, 1024*1024)
+	for i := range buffer {
+		buffer[i] = pattern[i%len(pattern)]
+	}
+
+	remaining := sizeBytes
+	for remaining > 0 {
+		chunk := buffer
+		if remaining < int64(len(chunk)) {
+			chunk = buffer[:remaining]
+		}
+
+		written, err := writer.Write(chunk)
+		if err != nil {
+			return err
+		}
+		remaining -= int64(written)
+	}
+	return nil
 }
 
 func calculateSHA256(file *os.File) (string, error) {
